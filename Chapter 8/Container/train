@@ -1,0 +1,108 @@
+#!/usr/bin/env python
+
+# A sample training component that trains a simple scikit-learn decision tree model.
+# This implementation works in File mode and makes no assumptions about the input file names.
+# Input is specified as CSV with a data point in each row and the labels in the first column.
+
+from __future__ import print_function
+
+import os
+import json
+import pickle
+import sys
+import traceback
+
+import pandas as pd
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import StandardScaler
+
+# These are the paths to where SageMaker mounts interesting things in your container.
+
+prefix = '/opt/ml/'
+
+input_path = prefix + 'input/data'
+output_path = os.path.join(prefix, 'output')
+model_path = os.path.join(prefix, 'model')
+
+# This algorithm has a single channel of input data called 'training'. Since we run in
+# File mode, the input files are copied to the directory specified here.
+channel_name='train'
+channel_name_2='validation'
+training_path = os.path.join(input_path, channel_name)
+validation_path = os.path.join(input_path, channel_name_2)
+# The function to execute the training.
+def train():
+    print('Starting the training.')
+    try:
+    
+        # Take the set of files and read them all into a single pandas dataframe
+        input_files = [ os.path.join(training_path, file) for file in os.listdir(training_path) ]
+        if len(input_files) == 0:
+            raise ValueError(('There are no files in {}.\n' +
+                              'This usually indicates that the channel ({}) was incorrectly specified,\n' +
+                              'the data specification in S3 was incorrectly specified or the role specified\n' +
+                              'does not have permission to access the data.').format(training_path, channel_name))
+        raw_data = [ pd.read_csv(file) for file in input_files ]
+        data = pd.concat(raw_data)
+        data = data.sample(frac=1)
+        
+        for i in data.Item_Type.value_counts().index:
+            data.loc[(data['Item_Weight'].isna()) & (data['Item_Type'] == i), ['Item_Weight']] = \
+            data.loc[data['Item_Type'] == 'Fruits and Vegetables', ['Item_Weight']].mean()[0]
+            
+        cat_data = data.select_dtypes(object)
+        num_data = data.select_dtypes(np.number)
+        
+        cat_data.loc[(cat_data['Outlet_Size'].isna()) & (cat_data['Outlet_Type'] == 'Grocery Store'), ['Outlet_Size']] = 'Small'
+        cat_data.loc[(cat_data['Outlet_Size'].isna()) & (cat_data['Outlet_Type'] == 'Supermarket Type1'), ['Outlet_Size']] = 'Small'
+        cat_data.loc[(cat_data['Outlet_Size'].isna()) & (cat_data['Outlet_Type'] == 'Supermarket Type2'), ['Outlet_Size']] = 'Medium'
+        cat_data.loc[(cat_data['Outlet_Size'].isna()) & (cat_data['Outlet_Type'] == 'Supermarket Type3'), ['Outlet_Size']] = 'Medium'
+        
+        cat_data.loc[cat_data['Item_Fat_Content'] == 'LF' , ['Item_Fat_Content']] = 'Low Fat'
+        cat_data.loc[cat_data['Item_Fat_Content'] == 'reg' , ['Item_Fat_Content']] = 'Regular'
+        cat_data.loc[cat_data['Item_Fat_Content'] == 'low fat' , ['Item_Fat_Content']] = 'Low Fat'
+        
+        le = LabelEncoder()
+        cat_data = cat_data.apply(le.fit_transform)
+        
+        ss = StandardScaler()
+        
+        num_data = pd.DataFrame(ss.fit_transform(num_data.drop(['Item_Outlet_Sales'], axis=1)), columns = num_data.drop(['Item_Outlet_Sales'],axis=1).columns)
+        cat_data = pd.DataFrame(ss.fit_transform(cat_data.drop(['Item_Identifier'], axis=1)), columns = cat_data.drop(['Item_Identifier'], axis=1).columns)
+        
+        final_data = pd.concat([num_data,cat_data],axis=1)
+        
+        X = final_data
+        y = data['Item_Outlet_Sales']
+        
+        from sklearn.model_selection import train_test_split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.1, random_state=5)
+        
+        from sklearn.ensemble import RandomForestRegressor
+        rfc = RandomForestRegressor(n_estimators=500)
+        
+        clf = rfc.fit(X_train, y_train)
+
+        # save the model
+        with open(os.path.join(model_path, 'randomForest-tree-model.pkl'), 'w') as out:
+            pickle.dump(clf, out)
+        print('Training complete.')
+    except Exception as e:
+        # Write out an error file. This will be returned as the failureReason in the
+        # DescribeTrainingJob result.
+        trc = traceback.format_exc()
+        with open(os.path.join(output_path, 'failure'), 'w') as s:
+            s.write('Exception during training: ' + str(e) + '\n' + trc)
+        # Printing this causes the exception to be in the training job logs, as well.
+        print('Exception during training: ' + str(e) + '\n' + trc, file=sys.stderr)
+        # A non-zero exit code causes the training job to be marked as Failed.
+        sys.exit(255)
+
+if __name__ == '__main__':
+    train()
+
+    # A zero exit code causes the job to be marked a Succeeded.
+    sys.exit(0)
